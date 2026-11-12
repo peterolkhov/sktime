@@ -287,6 +287,30 @@ jobs:
           )
           Path(os.environ['RUNNER_TEMP'], 'evidence', 'resolved-constraints.txt').write_text('\n'.join(constraints) + '\n')
           PY
+      - name: Verify installed runtime module bytes against the guarded pinned checkout
+        working-directory: upstream
+        run: |
+          python - <<'RUNTIME_OWNER'
+          import hashlib,inspect,json,pathlib,sys
+          import sktime
+          from sktime.forecasting.naive import NaiveForecaster
+          installed=pathlib.Path(sktime.__file__).resolve().parent
+          checkout=pathlib.Path.cwd()/"sktime"
+          receipts=[]
+          for name,module in sorted(list(sys.modules.items())):
+              filename=getattr(module,"__file__",None)
+              if not name.startswith("sktime") or not filename or not filename.endswith(".py"):
+                  continue
+              source=pathlib.Path(filename).resolve()
+              assert source.is_relative_to(installed),(name,str(source))
+              original=checkout/source.relative_to(installed)
+              assert original.is_file(),(name,str(original))
+              digest=hashlib.sha256(source.read_bytes()).hexdigest()
+              assert digest==hashlib.sha256(original.read_bytes()).hexdigest(),name
+              receipts.append({"module":name,"path":str(source),"sha256":digest})
+          assert any(item["module"]=="sktime.forecasting.naive._naive" for item in receipts)
+          print("SKTIME_RUNTIME_LOADED_SOURCE_MATCH="+json.dumps(receipts,sort_keys=True))
+          RUNTIME_OWNER
       - name: Observe six cases through actual public fitted model APIs
         working-directory: ${{ runner.temp }}
         shell: bash
@@ -300,6 +324,30 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest sktime/forecasting/tests/test_naive.py --matrixdesign False --only_changed_modules False -n0 2>&1 | tee "$RUNNER_TEMP/evidence/native-naive.log"
+      - name: Recheck installed runtime module bytes against the guarded pinned checkout
+        working-directory: upstream
+        run: |
+          python - <<'RUNTIME_OWNER'
+          import hashlib,inspect,json,pathlib,sys
+          import sktime
+          from sktime.forecasting.naive import NaiveForecaster
+          installed=pathlib.Path(sktime.__file__).resolve().parent
+          checkout=pathlib.Path.cwd()/"sktime"
+          receipts=[]
+          for name,module in sorted(list(sys.modules.items())):
+              filename=getattr(module,"__file__",None)
+              if not name.startswith("sktime") or not filename or not filename.endswith(".py"):
+                  continue
+              source=pathlib.Path(filename).resolve()
+              assert source.is_relative_to(installed),(name,str(source))
+              original=checkout/source.relative_to(installed)
+              assert original.is_file(),(name,str(original))
+              digest=hashlib.sha256(source.read_bytes()).hexdigest()
+              assert digest==hashlib.sha256(original.read_bytes()).hexdigest(),name
+              receipts.append({"module":name,"path":str(source),"sha256":digest})
+          assert any(item["module"]=="sktime.forecasting.naive._naive" for item in receipts)
+          print("SKTIME_RUNTIME_LOADED_SOURCE_MATCH="+json.dumps(receipts,sort_keys=True))
+          RUNTIME_OWNER
       - name: Independent whole tracked-tree and fixture AFTER guards
         if: ${{ !cancelled() }}
         shell: bash
