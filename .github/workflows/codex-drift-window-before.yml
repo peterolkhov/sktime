@@ -1,0 +1,320 @@
+name: sktime drift window native BEFORE
+on:
+  push:
+    branches: [codex/diagnose-drift-window-variance]
+permissions:
+  contents: read
+jobs:
+  before:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      FIXTURE_SHA256: 2020b208c0403a582f85969f80fc508a6a6c78ff4e361515619886072007fc5c
+      GUARD_SHA256: a46305260850083b94ad555a927697d740bcac558a3e39e19249e867ed256b2b
+    steps:
+      - name: Check out the exact complete unmodified upstream
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: sktime/sktime
+          ref: 2ce980e3b6fb67df72ecc256a167e201e02aeb09
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up upstream no-softdeps Python series
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.11'
+      - name: Materialize external frozen observation and guard scripts
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cat > "$RUNNER_TEMP/before-fixture.py" <<'FIXTURE'
+          """BEFORE observations through public sktime APIs; contains no proposed repair."""
+          
+          from __future__ import annotations
+          
+          import importlib.metadata
+          import json
+          import math
+          from pathlib import Path
+          import platform
+          from statistics import NormalDist
+          import sys
+          import traceback
+          
+          import numpy as np
+          import pandas as pd
+          import sktime
+          from sktime.forecasting.naive import NaiveForecaster
+          
+          
+          OUTPUT = Path(sys.argv[1])
+          checks = []
+          records = []
+          
+          
+          def close(actual, expected, name):
+              np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+              checks.append(name)
+          
+          
+          def frame(value):
+              return {
+                  "index": [int(x) for x in value.index],
+                  "columns": [list(x) if isinstance(x, tuple) else x for x in value.columns]
+                  if isinstance(value, pd.DataFrame)
+                  else None,
+                  "values": value.to_numpy().tolist(),
+              }
+          
+          
+          def point_model_oracle(values, window):
+              """The documented line through the selected window's two endpoints."""
+              selected = values if window is None else values[-window:]
+              steps_between_endpoints = len(selected) - 1
+              slope = (selected[-1] - selected[0]) / steps_between_endpoints
+              return slope, [values[-1] + horizon * slope for horizon in (1, 2)]
+          
+          
+          def residual_oracle(values, slope):
+              """Independent consecutive-step errors for the fitted point-model slope.
+          
+              Keep the existing all-history residual and horizon-inflation convention
+              solely to isolate the inconsistent slope. This does not prescribe the
+              statistically appropriate final finite-window estimator.
+              """
+              increments = [right - left for left, right in zip(values, values[1:])]
+              errors = [increment - slope for increment in increments]
+              residual_variance = sum(error * error for error in errors) / (len(errors) - 1)
+              forecast_variance = [
+                  residual_variance * horizon * (1 + horizon / len(increments))
+                  for horizon in (1, 2)
+              ]
+              return errors, forecast_variance
+          
+          
+          def observe():
+              fixtures = {
+                  "linear": {
+                      "values": [0., 1., 2., 3., 4., 5.],
+                      "expected_before_variances": {"none": [0., 0.], "full": [0., 0.], "three": [.54, 1.26]},
+                  },
+                  "nonlinear": {
+                      "values": [0., 1., 1., 3., 4., 6.],
+                      "expected_before_variances": {"none": [.84, 1.96], "full": [.84, 1.96], "three": [1.38, 3.22]},
+                  },
+              }
+              z = NormalDist().inv_cdf(.9)
+              for fixture_name, fixture in fixtures.items():
+                  for window_name, window in (("none", None), ("full", 6), ("three", 3)):
+                      values = fixture["values"]
+                      y = pd.Series(values, name="owned_observation")
+                      original = y.copy(deep=True)
+                      model = NaiveForecaster(strategy="drift", window_length=window).fit(y)
+                      prediction = model.predict([1, 2])
+                      variance = model.predict_var([1, 2])
+                      quantiles = model.predict_quantiles([1, 2], alpha=[.1, .5, .9])
+                      interval = model.predict_interval([1, 2], coverage=.8)
+                      slope, expected_points = point_model_oracle(values, window)
+                      errors, oracle_variance = residual_oracle(values, slope)
+                      expected_before = fixture["expected_before_variances"][window_name]
+                      record = {
+                          "fixture": fixture_name,
+                          "window": window,
+                          "role": "affected" if window == 3 else "control",
+                          "input": values,
+                          "expected_point_slope": slope,
+                          "expected_points": expected_points,
+                          "point_model_one_step_residuals": errors,
+                          "variance_with_consistent_point_slope_same_history_convention": oracle_variance,
+                          "expected_before_variance": expected_before,
+                          "observed_predict": frame(prediction),
+                          "observed_predict_var": frame(variance),
+                          "observed_predict_quantiles": frame(quantiles),
+                          "observed_predict_interval": frame(interval),
+                      }
+                      records.append(record)
+                      label = fixture_name + "/" + window_name
+                      close(prediction.to_numpy(), expected_points, label + ":points")
+                      close(variance.to_numpy()[:, 0], expected_before, label + ":expected-before-variance")
+                      widths = [z * math.sqrt(v) for v in expected_before]
+                      expected_quantiles = [[p - w, p, p + w] for p, w in zip(expected_points, widths)]
+                      expected_intervals = [[p - w, p + w] for p, w in zip(expected_points, widths)]
+                      close(quantiles.to_numpy(), expected_quantiles, label + ":public-quantiles")
+                      close(interval.to_numpy(), expected_intervals, label + ":public-intervals")
+                      pd.testing.assert_series_equal(y, original)
+                      checks.append(label + ":owned-input-unchanged")
+                      if window != 3:
+                          close(variance.to_numpy()[:, 0], oracle_variance, label + ":control-oracle")
+                      else:
+                          assert not np.allclose(variance.to_numpy()[:, 0], oracle_variance, rtol=1e-12, atol=1e-12)
+                          checks.append(label + ":expected-before-oracle-mismatch")
+                      if fixture_name == "linear":
+                          close(errors, [0.] * 5, label + ":linear-zero-residual-invariant")
+                          close(oracle_variance, [0., 0.], label + ":linear-zero-variance-invariant")
+              assert len(records) == 6
+              assert sum(record["role"] == "control" for record in records) == 4
+              assert sum(record["role"] == "affected" for record in records) == 2
+              checks.append("six-cases-four-controls-two-affected")
+          
+          
+          report = {
+              "stage": "before",
+              "upstream_pin": "2ce980e3b6fb67df72ecc256a167e201e02aeb09",
+              "status": "started",
+              "python": sys.version,
+              "platform": platform.platform(),
+              "sktime_import_path": sktime.__file__,
+              "distribution_versions": {
+                  item.metadata["Name"]: item.version
+                  for item in importlib.metadata.distributions()
+                  if item.metadata.get("Name")
+              },
+              "cases": records,
+              "checks": checks,
+          }
+          try:
+              observe()
+          except BaseException:
+              report["status"] = "unexpected-result-or-error"
+              report["traceback"] = traceback.format_exc()
+              raise
+          else:
+              report["status"] = "expected-before-defect-observed"
+          finally:
+              report["case_count"] = len(records)
+              report["check_count"] = len(checks)
+              OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+              OUTPUT.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+          FIXTURE
+          cat > "$RUNNER_TEMP/source-guard.py" <<'GUARD'
+          """Independently freeze all tracked source bytes and the external fixture."""
+          
+          from __future__ import annotations
+          
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          
+          
+          mode, upstream_arg, evidence_arg, fixture_arg, fixture_sha, guard_sha = sys.argv[1:]
+          upstream = Path(upstream_arg).resolve()
+          evidence = Path(evidence_arg).resolve()
+          fixture = Path(fixture_arg).resolve()
+          evidence.mkdir(parents=True, exist_ok=True)
+          
+          
+          def git(*args):
+              return subprocess.check_output(["git", "-C", str(upstream), *args])
+          
+          
+          assert hashlib.sha256(fixture.read_bytes()).hexdigest() == fixture_sha
+          assert hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == guard_sha
+          assert git("rev-parse", "HEAD").decode().strip() == "2ce980e3b6fb67df72ecc256a167e201e02aeb09"
+          assert git("rev-parse", "HEAD^{tree}").decode().strip() == "860e5957e2a2698a5240cbd99f1487b55da1946a"
+          assert not git("status", "--porcelain=v1", "--untracked-files=no").strip()
+          snapshot = {}
+          for entry in git("ls-files", "--stage", "-z").split(b"\0"):
+              if not entry:
+                  continue
+              index_data, encoded_path = entry.split(b"\t", 1)
+              permissions, blob, stage = index_data.decode().split()
+              assert stage == "0"
+              relative = os.fsdecode(encoded_path)
+              source = upstream / relative
+              if permissions == "120000":
+                  content = os.fsencode(os.readlink(source))
+              else:
+                  assert permissions in ("100644", "100755"), permissions
+                  content = source.read_bytes()
+              snapshot[relative] = {
+                  "index_mode": permissions,
+                  "index_blob": blob,
+                  "sha256": hashlib.sha256(content).hexdigest(),
+                  "bytes": len(content),
+              }
+          payload = {
+              "upstream_pin": git("rev-parse", "HEAD").decode().strip(),
+              "upstream_tree": git("rev-parse", "HEAD^{tree}").decode().strip(),
+              "fixture_sha256": fixture_sha,
+              "guard_sha256": guard_sha,
+              "tracked_file_count": len(snapshot),
+              "tracked_files": snapshot,
+          }
+          snapshot_file = evidence / (mode + "-source-manifest.json")
+          snapshot_file.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+          if mode == "after":
+              before = json.loads((evidence / "before-source-manifest.json").read_text())
+              assert payload == before, "Tracked bytes, index, tree, or fixture changed"
+              (evidence / "source-guards-passed.json").write_text(json.dumps({
+                  "status": "passed",
+                  "tracked_file_count": len(snapshot),
+                  "fixture_sha256": fixture_sha,
+                  "guard_sha256": guard_sha,
+              }, indent=2) + "\n")
+          print(json.dumps({"mode": mode, "tracked_file_count": len(snapshot), "status": "passed"}))
+          GUARD
+      - name: Independent whole tracked-tree and fixture BEFORE guards
+        shell: bash
+        run: |
+          python "$RUNNER_TEMP/source-guard.py" before "$GITHUB_WORKSPACE/upstream" "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/before-fixture.py" "$FIXTURE_SHA256" "$GUARD_SHA256"
+      - name: Install only the exact upstream native no-softdeps developer route
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -o pipefail
+          python -VV 2>&1 | tee "$RUNNER_TEMP/evidence/python-version.txt"
+          python -m pip --version | tee "$RUNNER_TEMP/evidence/pip-version.txt"
+          python -m pip install --report "$RUNNER_TEMP/evidence/pip-install-report.json" '.[dev]' 2>&1 | tee "$RUNNER_TEMP/evidence/install.log"
+          python -m pip check 2>&1 | tee "$RUNNER_TEMP/evidence/pip-check.txt"
+          python -m pip freeze --all > "$RUNNER_TEMP/evidence/pip-freeze.txt"
+          python -m pip inspect > "$RUNNER_TEMP/evidence/pip-inspect.json"
+          python - <<'PY'
+          import importlib.metadata
+          import os
+          from pathlib import Path
+          constraints = sorted(
+              item.metadata['Name'] + '==' + item.version
+              for item in importlib.metadata.distributions()
+              if item.metadata.get('Name') and item.metadata['Name'].lower() != 'sktime'
+          )
+          Path(os.environ['RUNNER_TEMP'], 'evidence', 'resolved-constraints.txt').write_text('\n'.join(constraints) + '\n')
+          PY
+      - name: Observe six cases through actual public fitted model APIs
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python "$RUNNER_TEMP/before-fixture.py" "$RUNNER_TEMP/evidence/public-before.json" 2>&1 | tee "$RUNNER_TEMP/evidence/public-before.log"
+      - name: Existing complete native naive tests with normal project hooks
+        if: ${{ !cancelled() }}
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest sktime/forecasting/tests/test_naive.py --matrixdesign False --only_changed_modules False -n0 2>&1 | tee "$RUNNER_TEMP/evidence/native-naive.log"
+      - name: Independent whole tracked-tree and fixture AFTER guards
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python "$RUNNER_TEMP/source-guard.py" after "$GITHUB_WORKSPACE/upstream" "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/before-fixture.py" "$FIXTURE_SHA256" "$GUARD_SHA256"
+          git -C upstream status --short > "$RUNNER_TEMP/evidence/upstream-status.txt"
+          sha256sum "$RUNNER_TEMP/before-fixture.py" "$RUNNER_TEMP/source-guard.py" > "$RUNNER_TEMP/evidence/harness-sha256.txt"
+      - name: Print actual observation and resolved environment receipts
+        if: always()
+        shell: bash
+        run: |
+          for receipt in public-before.json resolved-constraints.txt source-guards-passed.json; do
+            if [ -f "$RUNNER_TEMP/evidence/$receipt" ]; then
+              echo "RECEIPT_BEGIN=$receipt"
+              cat "$RUNNER_TEMP/evidence/$receipt"
+              echo "RECEIPT_END=$receipt"
+            fi
+          done
